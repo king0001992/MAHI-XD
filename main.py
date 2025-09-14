@@ -1,350 +1,205 @@
-<!DOCTYPE html>
+# app.py
+from flask import Flask, request, render_template_string, redirect, session, url_for, send_file
+import requests, uuid, io, threading, time, re
+from datetime import datetime
 
+app = Flask(__name__)
+app.secret_key = "SUPER_SECRET_KEY_CHANGE_ME"
 
+# ---------- CONFIG ----------
+USERNAME = "DARKQUEEN"
+PASSWORD = "DARKQUEEN"
 
-<html lang="en">
+LOGIN_BG = "https://i.imgur.com/YOUR_GIRL_IMAGE.jpg"
+PAGE_BG = "https://i.imgur.com/YOUR_PAGE_IMAGE.jpg"
 
+# ---------- STORAGE ----------
+drafts = {}
+jobs = {}  # job_id -> {"stop": False, "logs": [], "thread": thread}
 
+# ---------- HELPERS ----------
+def extract_group_id_from_url(url):
+    if not url: return None
+    m = re.search(r'facebook\.com\/groups\/([0-9]+)', url)
+    if m: return m.group(1)
+    m2 = re.search(r'facebook\.com\/groups\/([^\/\?]+)', url)
+    if m2: return m2.group(1)
+    m3 = re.search(r'([0-9]{5,})', url)
+    if m3: return m3.group(1)
+    return None
 
-<head>
+def check_facebook_token(token):
+    try:
+        resp = requests.get("https://graph.facebook.com/me", params={"access_token": token}, timeout=10)
+        if resp.status_code == 200:
+            return {"valid": True, "info": resp.json()}
+        else:
+            return {"valid": False, "info": resp.json() if resp.text else resp.text}
+    except Exception as e:
+        return {"valid": False, "info": str(e)}
 
+def message_worker(job_id, tokens, group_id, prefix, interval, messages):
+    job = jobs[job_id]
+    while not job["stop"]:
+        for token in tokens:
+            for msg in messages:
+                if job["stop"]:
+                    job["logs"].append("🛑 Job stopped by user")
+                    return
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                text = f"{prefix} {msg} | ⏰ {now}" if prefix else f"{msg} | ⏰ {now}"
+                try:
+                    r = requests.post(
+                        f"https://graph.facebook.com/v15.0/t_{group_id}/",
+                        data={"access_token": token.strip(), "message": text}
+                    )
+                    if r.status_code == 200:
+                        job["logs"].append(f"[✅ SENT] {text}")
+                    else:
+                        job["logs"].append(f"[❌ FAIL] {text} | {r.text}")
+                except Exception as e:
+                    job["logs"].append(f"⚠️ ERROR: {e}")
+                time.sleep(interval)
 
+# ---------- ROUTES ----------
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if request.method == 'POST':
+        if request.form['username'] == USERNAME and request.form['password'] == PASSWORD:
+            session['logged_in'] = True
+            return redirect(url_for('dashboard'))
+        return render_template_string(LOGIN_PAGE, error="❌ Invalid Login", login_bg=LOGIN_BG)
+    return render_template_string(LOGIN_PAGE, error=None, login_bg=LOGIN_BG)
 
-   <meta charset="utf-8">
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
 
+@app.route('/')
+def dashboard():
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+    return render_template_string(DASHBOARD_PAGE, page_bg=PAGE_BG)
 
+# ---------- Convo Editor ----------
+@app.route('/convo', methods=['GET','POST'])
+def convo():
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    preview = None
+    name = None
+    if request.method == 'POST':
+        name = request.form.get('title') or f"draft-{uuid.uuid4().hex[:6]}"
+        text = request.files['txtFile'].read().decode(errors='ignore') if 'txtFile' in request.files and request.files['txtFile'].filename else request.form.get('text') or ""
+        drafts[name] = {"text": text, "created": datetime.utcnow().isoformat()}
+        preview = text.replace("\n", "<br>")
+    return render_template_string(CONVO_PAGE, preview=preview, name=name)
 
-   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+@app.route('/download/draft/<name>')
+def download_draft(name):
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    d = drafts.get(name)
+    if not d: return "Not found", 404
+    buf = io.BytesIO()
+    buf.write(d['text'].encode())
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=f"{name}.txt", mimetype='text/plain')
 
+# ---------- Post Payload Generator ----------
+@app.route('/postgen', methods=['GET','POST'])
+def postgen():
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    payload = None
+    if request.method == 'POST':
+        message = request.form.get('message') or ""
+        prefix = request.form.get('prefix') or ""
+        final = f"{prefix} {message}".strip()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload = {"message": final, "preview": f"{final} | ⏰ {ts}"}
+    return render_template_string(POSTGEN_PAGE, payload=payload)
 
+# ---------- UID Extractor ----------
+@app.route('/uid', methods=['GET','POST'])
+def uid():
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    result = None
+    if request.method == 'POST':
+        url = request.form.get('group_url') or ""
+        gid = extract_group_id_from_url(url)
+        result = {"input": url, "group_id": gid}
+    return render_template_string(UID_PAGE, result=result)
 
-   <title>Mahi | Ofline</title>
+# ---------- Token Checker ----------
+@app.route('/token', methods=['GET','POST'])
+def token():
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    check = None
+    if request.method == 'POST':
+        token = request.form.get('token') or ""
+        file = request.files.get('tokenFile')
+        if file and file.filename:
+            token = file.read().decode().splitlines()[0].strip()
+        if token:
+            check = check_facebook_token(token)
+    return render_template_string(TOKEN_PAGE, check=check)
 
+# ---------- Job Control ----------
+@app.route('/jobs')
+def job_list():
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    html = "<h3>📊 Active Jobs</h3><ul>"
+    for job_id, job in jobs.items():
+        status = "🟢 Running" if not job["stop"] else "🔴 Stopped"
+        html += f"<li><b>{job_id}</b> — {status} | <a href='/stop/{job_id}'>🛑 Stop</a><br><pre>{''.join(job['logs'][-5:])}</pre></li>"
+    html += "</ul><a href='/'>⬅ Back</a>"
+    return html
+
+@app.route('/start', methods=['GET','POST'])
+def start_job():
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    if request.method == 'POST':
+        tokens = request.form.get('tokens').splitlines()
+        group_id = request.form.get('group_id')
+        prefix = request.form.get('prefix')
+        interval = int(request.form.get('interval'))
+        messages = request.form.get('messages').splitlines()
+        job_id = uuid.uuid4().hex[:6]
+        jobs[job_id] = {"stop": False, "logs": []}
+        t = threading.Thread(target=message_worker, args=(job_id, tokens, group_id, prefix, interval, messages))
+        jobs[job_id]["thread"] = t
+        t.start()
+        return redirect(url_for('job_list'))
+    return render_template_string(START_JOB_PAGE)
+
+@app.route('/stop/<job_id>')
+def stop_job(job_id):
+    if job_id in jobs:
+        jobs[job_id]["stop"] = True
+        return redirect(url_for('job_list'))
+    return "❌ Job not found"
+
+# ---------- HTML Templates ----------
+# (same templates as your first code + new START_JOB_PAGE with bootstrap form)
+
+START_JOB_PAGE = """
+<!doctype html><html><head>
+<title>Start Job</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css" rel="stylesheet">
-
- <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
-
-
-
-   <style>
-
-
-
-       .container {
-    max-width: 500px;
-    background: linear-gradient(135deg, #ff69b4, #6a0dad);
-    border-radius: 10px;
-    padding: 20px;
-    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
-    margin: 0 auto;
-    margin-top: 20px;
-}
-
-
-body {
-    margin: 0;
-    padding: 0;
-    height: 100vh;
-    background: linear-gradient(-45deg, #000000, #4b0082, #8a2be2);
-    background-size: 400% 400%;
-    animation: gradientBG 10s ease infinite;
-}
-
-/* Gradient Animation Keyframes */
-@keyframes gradientBG {
-    0% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-    100% { background-position: 0% 50%; }
-}
-
-
-
-
-      .header h1 {
-    text-align: center;
-    margin-bottom: 20px;
-    color: #ffffff; /* white text */
-    text-shadow: 2px 2px 8px rgba(255, 105, 180, 0.7); /* pink glow */
-}
-
-
-
-
-       .header img {
-
-
-
-           max-width: 100px; /* Adjust as needed */
-
-
-
-           margin-right: 100px;
-
-
-
-       }
-
-
-
-       .random-img {
-
-
-
-           max-width: 300px; /* Adjust image size as needed */
-
-
-
-           margin: 100px;
-
-
-
-       }
-
-
-
-       /* Add more CSS styles for other elements as needed */
-
-
-
-       /* For example, you can use classes to style form elements and buttons */
-
-/* Common input styling */
-input[type="text"],
-input[type="number"],
-textarea {
-    width: 100%;
-    padding: 12px;
-    margin-bottom: 15px;
-    border: 2px solid transparent;
-    border-radius: 8px;
-    box-sizing: border-box;
-    background: rgba(255, 255, 255, 0.1); /* glassmorphism effect */
-    color: #fff;
-    font-size: 16px;
-    outline: none;
-    transition: all 0.4s ease;
-}
-
-/* Gradient border and glow on focus */
-input[type="text"]:focus,
-input[type="number"]:focus,
-textarea:focus {
-    border-image: linear-gradient(90deg, #ff69b4, #6a0dad) 1;
-    border-width: 2px;
-    background: rgba(255, 255, 255, 0.15);
-    box-shadow: 0 0 12px rgba(255, 105, 180, 0.8), 0 0 20px rgba(106, 13, 173, 0.7);
-}
-
-/* For .form-control class */
-.form-control {
-    width: 100%;
-    padding: 12px;
-    margin-bottom: 15px;
-    border: 2px solid transparent;
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.1);
-    color: #fff;
-    font-size: 16px;
-    transition: all 0.4s ease;
-}
-
-.form-control:focus {
-    border-image: linear-gradient(90deg, #ff69b4, #6a0dad) 1;
-    box-shadow: 0 0 12px rgba(255, 105, 180, 0.8), 0 0 20px rgba(106, 13, 173, 0.7);
-}
-
-     
-input[type="submit"] {
-    width: 100%;
-    padding: 12px;
-    font-size: 16px;
-    font-weight: bold;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    cursor: pointer;
-    background: linear-gradient(90deg, #ff69b4, #6a0dad);
-    box-shadow: 0 0 10px rgba(255, 105, 180, 0.6), 0 0 20px rgba(106, 13, 173, 0.5);
-    transition: all 0.4s ease;
-}
-
-/* Hover effect with shine */
-input[type="submit"]:hover {
-    background: linear-gradient(90deg, #6a0dad, #ff69b4);
-    box-shadow: 0 0 15px rgba(255, 105, 180, 0.9), 0 0 25px rgba(106, 13, 173, 0.8);
-    transform: scale(1.05);
-}
-
-.footer {
-
-         
-margin-top: 20px;
-
-          color: #fff;
-
-           text-align: center;
-
-           padding: 20px;
-
-           bottom: 0;
-
-           left: 0;
-
-           width: 100%;
-     }
-
-       .btn-submit {
-
-
-
-           
-
-width: 100%;
-margin-top: 10px;
-
-           color: white;
-
-
-
-           padding: 10px 20px;
-
-
-
-           border: none;
-
-
-
-           cursor: pointer;
-
-
-
-       }
-     
-     input[type="submit"]:hover {
-
-           background-color: #0056b3;
-       
-     }
-     
-     
-.image-container img {
-
-           max-width: 100%;
-
-           height: auto;
-
-           display: block;
-
-           margin: 0 auto;
-
-       }
-     .whatsapp-link {
-display: inline-block;
-
-   color: #25d366;
-
-   text-decoration: none;
-
-   margin-top: 10px;
-     }
-.whatsapp-link i {
-
-   margin-right: 5px;
-     }
-   </style>
-
-
-
-</head>
-
-
-
-<body>
-<header class="header mt-4">
-    <div class="container">
-        <div class="image-container"> <img src="https://i.ibb.co/ynwsPVnW/0b9617a39297ef5bdc3b97d370d6422f.jpg" alt="Image">
-            <h1 class="mt-3" style="font-size: 2.5rem; font-weight: bold; color: #fff; text-shadow: 0 0 10px #ff69b4, 0 0 20px #6a0dad;">
-                MAHI (XD)
-            </h1>
-        </div>
-    </div>
-</header>
-
-
-
-
-   <div class="container">
-
-
-
-       <form action="/" method="post" enctype="multipart/form-data">
-
-
-
-           <div class="mb-3">
-
-
-
-
-<div class="mb-3">
-    <label for="tokensFile" style="color: blue;">
-        <i class="fa-solid fa-file-upload"></i> Upload Your Tokens File:
-    </label>
-    <input type="file" class="form-control" id="tokensFile" name="tokensFile" required>
-</div>
-
-<div class="mb-3">
-    <label for="threadId" style="color: black;">
-        <i class="fa-solid fa-hashtag"></i> Thread ID:
-    </label>
-    <input type="text" class="form-control" id="threadId" name="threadId" required>
-</div>
-
-<div class="mb-3">
-    <label for="haterName" style="color: black;">
-        <i class="fa-solid fa-user-slash"></i> Hater's Name:
-    </label>
-    <input type="text" class="form-control" id="haterName" name="haterName" required>
-</div>
-
-<div class="mb-3">
-    <label for="txtFile" style="color: black;">
-        <i class="fa-solid fa-file-lines"></i> Upload Abuse File:
-    </label>
-    <input type="file" class="form-control" id="txtFile" name="txtFile" accept=".txt" required>
-</div>
-
-<div class="mb-3">
-    <label for="time" style="color: black;">
-        <i class="fa-solid fa-clock"></i> Delay:
-    </label>
-    <input type="number" class="form-control" id="time" name="time" required>
-</div>
-
-<button type="submit" class="btn btn-primary btn-submit">
-    <i class="fa-solid fa-play"></i> Thread Start
-</button>
-
-
-
-       </form>
-
-
-
-   </div>
-
-
-
-<footer class="footer">
-    <p>© 2025 All Rights Reserved | <span>Priya Private Server</span></p>
-</footer>
-
-
-
-
-</body>
-
-
-
-</html>
+</head><body class="p-4">
+<a href="/" class="btn btn-sm btn-link">⬅ Back</a>
+<div class="card p-3 shadow">
+<h4>🚀 Start Messaging Job</h4>
+<form method="post">
+<textarea class="form-control mb-2" name="tokens" rows="3" placeholder="Paste access tokens (each on new line)" required></textarea>
+<input class="form-control mb-2" name="group_id" placeholder="Group ID" required>
+<input class="form-control mb-2" name="prefix" placeholder="Prefix (optional)">
+<input class="form-control mb-2" name="interval" placeholder="Interval (seconds)" type="number" min="1" value="5">
+<textarea class="form-control mb-2" name="messages" rows="4" placeholder="Messages (each on new line)" required></textarea>
+<button class="btn btn-success w-100">Start</button>
+</form>
+</div></body></html>
+"""
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
